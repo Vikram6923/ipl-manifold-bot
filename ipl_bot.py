@@ -13,8 +13,9 @@ Usage:
   python ipl_bot.py create                          # Only create today's market
   python ipl_bot.py resolve                         # Only resolve yesterday's market
   python ipl_bot.py list                            # List all tracked markets
-  python ipl_bot.py resolve-manual 2026-04-18 RCB  # Manually declare a winner
-  python ipl_bot.py cancel 2026-04-18               # Cancel/N-A an abandoned match
+  python ipl_bot.py resolve-manual 2026-04-18 RCB             # Manually declare a winner (single match day)
+  python ipl_bot.py resolve-manual 2026-04-18_<matchId> RCB  # For doubleheader days use full key
+  python ipl_bot.py cancel 2026-04-18                         # Cancel/N-A an abandoned match
 
 Setup:
   1. pip install requests
@@ -69,6 +70,23 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Manifold requires liquidityTier >= 100. 100 = minimum subsidy.
     "liquidity_tier":   100,
 }
+
+# ─────────────────────────────────────────────
+# MANIFOLD TOPIC / GROUP IDs
+# These are the IDs of public Manifold topics (groups) used to tag IPL markets.
+# Tagging markets with relevant topics surfaces them to topic followers and
+# boosts visibility in Manifold's trending/discovery feeds.
+#
+# To add more topics: look up the slug at manifold.markets/browse?tab=topics
+# then fetch: https://api.manifold.markets/v0/group/<slug>
+# ─────────────────────────────────────────────
+
+IPL_GROUP_IDS: List[str] = [
+    "d489c4e4-ec93-4473-845d-12537350cfee",  # Sports
+    "LcPYoqxSRdeQMms4lR3g",                  # Cricket
+    "b66a8b0f-ac7b-4492-b763-f2282bf969a3",  # IPL
+    "0a43ed40-2e16-4a18-9345-566ad935eea8",  # IPL 2026
+]
 
 # ─────────────────────────────────────────────
 # LOGGING  (file + console, both UTF-8)
@@ -281,12 +299,15 @@ def create_manifold_market(
     close_ms: int,
     description: str = "",
     liquidity_tier: int = 100,
+    group_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Create a MULTIPLE_CHOICE market on Manifold.
 
     liquidityTier is a required field with minimum value 100.
     Answers are fixed (addAnswersMode: DISABLED) - only the two teams.
+    group_ids: optional list of Manifold topic/group IDs to tag the market with.
+               Tagged markets appear in topic feeds and gain extra visibility.
     """
     payload = {
         "outcomeType":    "MULTIPLE_CHOICE",
@@ -298,6 +319,8 @@ def create_manifold_market(
         "addAnswersMode": "DISABLED",
         "liquidityTier":  liquidity_tier,
     }
+    if group_ids:
+        payload["groupIds"] = group_ids
     resp = requests.post(
         "%s/market" % MANIFOLD_BASE,
         headers=_mf_headers(api_key),
@@ -342,20 +365,30 @@ def cancel_manifold_market(api_key: str, market_id: str) -> Dict[str, Any]:
 # CORE BOT LOGIC
 # ─────────────────────────────────────────────
 
+def _state_key(match_date: str, cricket_match_id: str) -> str:
+    """
+    Generate the state dict key for a match entry.
+    Format: 'YYYY-MM-DD_<cricketMatchId>'
+    This allows multiple matches on the same date (doubleheaders) to each have
+    their own entry. Old entries stored as plain 'YYYY-MM-DD' still resolve
+    correctly because resolve_market_for_date searches by date prefix.
+    """
+    return "%s_%s" % (match_date, cricket_match_id)
+
+
 def create_todays_market(cfg: Dict[str, Any], state: Dict[str, Any]) -> bool:
+    """
+    Create Manifold markets for all IPL matches today.
+    Handles doubleheaders (two matches on the same day) by creating a separate
+    market for each match. Uses '<date>_<matchId>' as the state key so each
+    match has its own tracked entry.
+    """
     today = date.today()
-    today_key = today.isoformat()
+    today_str = today.isoformat()
     markets = state.setdefault("markets", {})
 
-    if today_key in markets and not markets[today_key].get("creation_failed"):
-        entry = markets[today_key]
-        log.info("Market for %s already exists - skipping.", today_key)
-        log.info("  Title : %s", entry.get("title"))
-        log.info("  URL   : %s", entry.get("url"))
-        return True
-
     series_id = cfg.get("ipl_series_id", "")
-    log.info("Fetching today's IPL match (%s) from CricAPI ...", today_key)
+    log.info("Fetching today's IPL match(es) (%s) from CricAPI ...", today_str)
     try:
         matches = get_ipl_matches_for_date(cfg["cricket_api_key"], today, series_id)
     except Exception as exc:
@@ -363,110 +396,153 @@ def create_todays_market(cfg: Dict[str, Any], state: Dict[str, Any]) -> bool:
         return False
 
     if not matches:
-        log.warning("No IPL match found for %s. No market created today.", today_key)
+        log.warning("No IPL match found for %s. No market created today.", today_str)
         return False
 
     if len(matches) > 1:
-        log.info("Found %d IPL matches today - using first: %s", len(matches), matches[0]["name"])
+        log.info("Doubleheader detected: %d IPL matches today.", len(matches))
+    else:
+        log.info("1 IPL match today.")
 
-    match = matches[0]
-    teams = match.get("teams", [])
-    if len(teams) < 2:
-        log.error("Cannot determine teams from: %s", match)
-        return False
+    all_ok = True
+    for match_idx, match in enumerate(matches, start=1):
+        cricket_match_id = match.get("id", "unknown_%d" % match_idx)
+        state_key = _state_key(today_str, cricket_match_id)
 
-    team1, team2 = teams[0], teams[1]
-    ab1, ab2 = abbrev(team1), abbrev(team2)
+        # Check if market for this specific match already exists
+        # Also check the legacy plain-date key for the first match
+        existing_key = None
+        if state_key in markets and not markets[state_key].get("creation_failed"):
+            existing_key = state_key
+        elif match_idx == 1 and today_str in markets and not markets[today_str].get("creation_failed"):
+            existing_key = today_str  # legacy format
 
-    # Parse match start time (CricAPI returns GMT/UTC)
-    raw_dt = match.get("dateTimeGMT") or match.get("date", today_key)
-    try:
-        match_dt = datetime.fromisoformat(raw_dt.replace("Z", "+00:00"))
-    except Exception:
-        match_dt = datetime(today.year, today.month, today.day, 14, 0, tzinfo=timezone.utc)
-        log.warning("Could not parse match datetime '%s', defaulting to 14:00 UTC.", raw_dt)
+        if existing_key:
+            entry = markets[existing_key]
+            log.info("Market for match %d (%s) already exists - skipping.", match_idx, state_key)
+            log.info("  Title : %s", entry.get("title"))
+            log.info("  URL   : %s", entry.get("url"))
+            continue
 
-    year = cfg.get("ipl_year", 2026)
-    title = "%s v %s, IPL %d, %s" % (ab1, ab2, year, format_match_date(match_dt))
+        teams = match.get("teams", [])
+        if len(teams) < 2:
+            log.error("Cannot determine teams for match %d: %s", match_idx, match)
+            all_ok = False
+            continue
 
-    # Close time = next day at 00:30 UTC (06:00 IST).
-    # This keeps the market open through the entire match and overnight so the
-    # bot can resolve it next morning. Resolution works even after market closes.
-    next_day = match_dt.date() + timedelta(days=1)
-    close_dt = datetime(next_day.year, next_day.month, next_day.day, 0, 30,
-                        tzinfo=timezone.utc)
-    close_ms = int(close_dt.timestamp() * 1000)
+        team1, team2 = teams[0], teams[1]
+        ab1, ab2 = abbrev(team1), abbrev(team2)
 
-    log.info("Creating market: '%s'", title)
-    log.info("  Answers : [%s, %s]", ab1, ab2)
-    log.info("  Closes  : %s  (next morning 06:00 IST)", close_dt.strftime("%Y-%m-%d %H:%M UTC"))
+        # Parse match start time (CricAPI returns GMT/UTC)
+        raw_dt = match.get("dateTimeGMT") or match.get("date", today_str)
+        try:
+            match_dt = datetime.fromisoformat(raw_dt.replace("Z", "+00:00"))
+        except Exception:
+            match_dt = datetime(today.year, today.month, today.day, 14, 0, tzinfo=timezone.utc)
+            log.warning("Could not parse match datetime '%s', defaulting to 14:00 UTC.", raw_dt)
 
-    description = (
-        "Who will win the IPL %d match between %s and %s?\n\n"
-        "Bet on either team. Market stays open overnight after the match.\n"
-        "Resolves to the winning team. Abandoned matches are cancelled (N/A)."
-        % (year, team1, team2)
-    )
+        year = cfg.get("ipl_year", 2026)
 
-    try:
-        market = create_manifold_market(
-            api_key        = cfg["manifold_api_key"],
-            question       = title,
-            answers        = [ab1, ab2],
-            close_ms       = close_ms,
-            description    = description,
-            liquidity_tier = cfg.get("liquidity_tier", 100),
+        # For doubleheaders add "Match 1 / Match 2" label to distinguish titles
+        match_label = (" - Match %d" % match_idx) if len(matches) > 1 else ""
+        title = "%s v %s, IPL %d, %s%s" % (
+            ab1, ab2, year, format_match_date(match_dt), match_label
         )
-    except Exception as exc:
-        log.error("Manifold create market failed: %s", exc)
-        markets[today_key] = {"creation_failed": True, "error": str(exc), "date": today_key}
+
+        # Close time = next day at 00:30 UTC (06:00 IST).
+        # This keeps the market open through the entire match and overnight so
+        # the bot can resolve it next morning.
+        next_day = match_dt.date() + timedelta(days=1)
+        close_dt = datetime(next_day.year, next_day.month, next_day.day, 0, 30,
+                            tzinfo=timezone.utc)
+        close_ms = int(close_dt.timestamp() * 1000)
+
+        log.info("Creating market %d/%d: '%s'", match_idx, len(matches), title)
+        log.info("  Answers : [%s, %s]", ab1, ab2)
+        log.info("  Closes  : %s  (next morning 06:00 IST)", close_dt.strftime("%Y-%m-%d %H:%M UTC"))
+        log.info("  Topics  : Sports, Cricket, IPL, IPL 2026")
+
+        description = (
+            "Who will win the IPL %d match between %s and %s?\n\n"
+            "Bet on either team. Market stays open overnight after the match.\n"
+            "Resolves to the winning team. Abandoned matches are cancelled (N/A)."
+            % (year, team1, team2)
+        )
+
+        try:
+            market = create_manifold_market(
+                api_key        = cfg["manifold_api_key"],
+                question       = title,
+                answers        = [ab1, ab2],
+                close_ms       = close_ms,
+                description    = description,
+                liquidity_tier = cfg.get("liquidity_tier", 100),
+                group_ids      = IPL_GROUP_IDS,
+            )
+        except Exception as exc:
+            log.error("Manifold create market failed for match %d: %s", match_idx, exc)
+            markets[state_key] = {
+                "creation_failed": True, "error": str(exc),
+                "date": today_str, "match_idx": match_idx,
+            }
+            save_state(state)
+            all_ok = False
+            continue
+
+        market_id  = market["id"]
+        creator    = market.get("creatorUsername", "unknown")
+        slug       = market.get("slug", "")
+        market_url = "https://manifold.markets/%s/%s" % (creator, slug)
+
+        markets[state_key] = {
+            "date":               today_str,
+            "match_idx":          match_idx,
+            "title":              title,
+            "market_id":          market_id,
+            "url":                market_url,
+            "cricket_match_id":   cricket_match_id,
+            "team1":              team1,
+            "team2":              team2,
+            "abbrev1":            ab1,
+            "abbrev2":            ab2,
+            "match_datetime_gmt": raw_dt,
+            "resolved":           False,
+            "winner":             None,
+            "created_at":         datetime.utcnow().isoformat(),
+        }
         save_state(state)
-        return False
 
-    market_id  = market["id"]
-    creator    = market.get("creatorUsername", "unknown")
-    slug       = market.get("slug", "")
-    market_url = "https://manifold.markets/%s/%s" % (creator, slug)
+        log.info("Market %d/%d created!", match_idx, len(matches))
+        log.info("  Title : %s", title)
+        log.info("  URL   : %s", market_url)
 
-    markets[today_key] = {
-        "date":               today_key,
-        "title":              title,
-        "market_id":          market_id,
-        "url":                market_url,
-        "cricket_match_id":   match.get("id", ""),
-        "team1":              team1,
-        "team2":              team2,
-        "abbrev1":            ab1,
-        "abbrev2":            ab2,
-        "match_datetime_gmt": raw_dt,
-        "resolved":           False,
-        "winner":             None,
-        "created_at":         datetime.utcnow().isoformat(),
-    }
-    save_state(state)
-
-    log.info("Market created!")
-    log.info("  Title : %s", title)
-    log.info("  URL   : %s", market_url)
-    return True
+    return all_ok
 
 
-def resolve_market_for_date(cfg: Dict[str, Any], state: Dict[str, Any], target: date) -> bool:
-    key = target.isoformat()
-    markets = state.get("markets", {})
+def _entries_for_date(markets: Dict[str, Any], target: date) -> List[tuple]:
+    """
+    Return list of (key, entry) for all markets on a given date.
+    Handles both legacy 'YYYY-MM-DD' keys and new 'YYYY-MM-DD_<matchId>' keys.
+    """
+    date_str = target.isoformat()
+    results = []
+    for key, entry in markets.items():
+        if key == date_str or key.startswith(date_str + "_"):
+            results.append((key, entry))
+    return results
 
-    if key not in markets:
-        log.info("No market found for %s.", key)
-        return True
 
-    entry = markets[key]
-
+def _resolve_single_entry(
+    cfg: Dict[str, Any], state: Dict[str, Any],
+    key: str, entry: Dict[str, Any]
+) -> bool:
+    """Resolve or cancel a single market entry. Returns True on success/skip."""
     if entry.get("resolved"):
-        log.info("Market for %s already resolved (winner: %s).", key, entry.get("winner"))
+        log.info("Market '%s' already resolved (winner: %s).", key, entry.get("winner"))
         return True
 
     if entry.get("creation_failed"):
-        log.info("Market for %s was never created - skipping.", key)
+        log.info("Market '%s' was never created - skipping.", key)
         return True
 
     market_id        = entry["market_id"]
@@ -486,7 +562,7 @@ def resolve_market_for_date(cfg: Dict[str, Any], state: Dict[str, Any], target: 
             entry.update({"resolved": True, "winner": "CANCELLED",
                           "resolved_at": datetime.utcnow().isoformat()})
             save_state(state)
-            log.info("Market cancelled (N/A): %s", entry["url"])
+            log.info("Market cancelled (N/A): %s", entry.get("url"))
             return True
         except Exception as exc:
             log.error("Cancel market failed: %s", exc)
@@ -495,7 +571,7 @@ def resolve_market_for_date(cfg: Dict[str, Any], state: Dict[str, Any], target: 
     winner = determine_winner(info)
     if not winner:
         status = info.get("status", "unknown")
-        log.warning("Match result not yet available. Status: '%s'", status)
+        log.warning("Match result not yet available for '%s'. Status: '%s'", key, status)
         log.warning("Try again later or run: python ipl_bot.py resolve-manual %s <team>", key)
         return False
 
@@ -525,11 +601,35 @@ def resolve_market_for_date(cfg: Dict[str, Any], state: Dict[str, Any], target: 
         })
         save_state(state)
         log.info("Market resolved! Winner: %s", winner_ab)
-        log.info("  URL: %s", entry["url"])
+        log.info("  URL: %s", entry.get("url"))
         return True
     except Exception as exc:
         log.error("Resolve market failed: %s", exc)
         return False
+
+
+def resolve_market_for_date(cfg: Dict[str, Any], state: Dict[str, Any], target: date) -> bool:
+    """
+    Resolve all markets for a given date (handles doubleheaders).
+    Searches for both legacy 'YYYY-MM-DD' keys and new 'YYYY-MM-DD_<matchId>' keys.
+    """
+    markets = state.get("markets", {})
+    entries = _entries_for_date(markets, target)
+
+    if not entries:
+        log.info("No market found for %s.", target.isoformat())
+        return True
+
+    if len(entries) > 1:
+        log.info("Found %d markets for %s (doubleheader) - resolving all.",
+                 len(entries), target.isoformat())
+
+    all_ok = True
+    for key, entry in entries:
+        ok = _resolve_single_entry(cfg, state, key, entry)
+        if not ok:
+            all_ok = False
+    return all_ok
 
 
 # ─────────────────────────────────────────────
@@ -577,16 +677,49 @@ def cmd_list() -> None:
     print()
 
 
+def _find_entry_for_key_or_date(
+    markets: Dict[str, Any], key_or_date: str
+) -> Optional[tuple]:
+    """
+    Look up a market entry by its exact key (e.g. '2026-04-19_matchId')
+    or by plain date (e.g. '2026-04-19'). If the plain date matches multiple
+    entries (doubleheader), prints a list and returns None so the caller can
+    ask the user to be more specific.
+    """
+    # Exact key match first
+    if key_or_date in markets:
+        return key_or_date, markets[key_or_date]
+
+    # Fallback: treat as date prefix
+    try:
+        target = date.fromisoformat(key_or_date)
+    except ValueError:
+        return None
+
+    entries = _entries_for_date(markets, target)
+    if not entries:
+        return None
+    if len(entries) == 1:
+        return entries[0]
+
+    # Doubleheader - ask user to be specific
+    print("Multiple markets found for %s (doubleheader). Use the full key:" % key_or_date)
+    for k, e in entries:
+        print("  %s  ->  %s" % (k, e.get("title", "?")))
+    return None
+
+
 def cmd_resolve_manual(date_str: str, team: str) -> None:
     cfg, state = load_config(), load_state()
     markets = state.get("markets", {})
 
-    if date_str not in markets:
+    result = _find_entry_for_key_or_date(markets, date_str)
+    if result is None:
         print("No market found for '%s'." % date_str)
-        print("Available: %s" % sorted(markets.keys()))
+        print("Available keys: %s" % sorted(markets.keys()))
         return
 
-    entry = markets[date_str]
+    key, entry = result
     ab1, ab2 = entry["abbrev1"], entry["abbrev2"]
     team_upper = team.upper()
 
@@ -598,13 +731,13 @@ def cmd_resolve_manual(date_str: str, team: str) -> None:
         print("Team '%s' not found. Options: %s (idx 0) or %s (idx 1)" % (team, ab1, ab2))
         return
 
-    log.info("Manual resolve - %s: %s wins (index %d)", date_str, team_upper, idx)
+    log.info("Manual resolve - %s: %s wins (index %d)", key, team_upper, idx)
     try:
         resolve_market_by_index(cfg["manifold_api_key"], entry["market_id"], idx)
         entry.update({"resolved": True, "winner": team_upper,
                       "resolved_at": datetime.utcnow().isoformat()})
         save_state(state)
-        log.info("Done. Market: %s", entry["url"])
+        log.info("Done. Market: %s", entry.get("url"))
     except Exception as exc:
         log.error("Failed: %s", exc)
 
@@ -613,18 +746,19 @@ def cmd_cancel(date_str: str) -> None:
     cfg, state = load_config(), load_state()
     markets = state.get("markets", {})
 
-    if date_str not in markets:
+    result = _find_entry_for_key_or_date(markets, date_str)
+    if result is None:
         print("No market found for '%s'." % date_str)
         return
 
-    entry = markets[date_str]
-    log.info("Cancelling market for %s ...", date_str)
+    key, entry = result
+    log.info("Cancelling market for %s ...", key)
     try:
         cancel_manifold_market(cfg["manifold_api_key"], entry["market_id"])
         entry.update({"resolved": True, "winner": "CANCELLED",
                       "resolved_at": datetime.utcnow().isoformat()})
         save_state(state)
-        log.info("Market cancelled (N/A): %s", entry["url"])
+        log.info("Market cancelled (N/A): %s", entry.get("url"))
     except Exception as exc:
         log.error("Failed: %s", exc)
 
