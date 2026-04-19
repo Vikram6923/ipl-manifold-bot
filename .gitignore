@@ -1,0 +1,20 @@
+# API keys and secrets — NEVER commit these
+config.json
+
+# Bot-generated state and cache files
+ipl_markets.json
+ipl_schedule_cache.json
+scheduler.log
+ipl_bot.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# Windows
+Thumbs.db
+desktop.ini

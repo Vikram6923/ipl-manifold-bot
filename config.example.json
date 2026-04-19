@@ -1,0 +1,7 @@
+{
+  "manifold_api_key": "YOUR_MANIFOLD_API_KEY_HERE",
+  "cricket_api_key": "YOUR_CRICKETDATA_API_KEY_HERE",
+  "ipl_series_id": "87c62aac-bc3c-4738-ab93-19da0690488f",
+  "ipl_year": 2026,
+  "liquidity_tier": 100
+}
